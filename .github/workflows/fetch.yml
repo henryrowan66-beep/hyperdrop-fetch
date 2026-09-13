@@ -1,0 +1,103 @@
+name: fetch-to-hyperdrop
+
+# Trigger: push a job file to jobs/<id>.json  ({"url": "...", "name": "optional-file-name"})
+# The Hyperagent connector can't dispatch workflows directly, so a pushed job file is the trigger.
+# Also supports manual runs from the Actions tab.
+on:
+  push:
+    paths: ["jobs/*.json"]
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Video / page URL for yt-dlp"
+        required: true
+      name:
+        description: "Optional output file name (without extension)"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fetch-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      HD_URL: https://hyperdrop.hyperdrop-4bd713.workers.dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve job
+        id: job
+        run: |
+          set -e
+          if [ -n "${{ github.event.inputs.url }}" ]; then
+            echo "url=${{ github.event.inputs.url }}" >> "$GITHUB_OUTPUT"
+            echo "name=${{ github.event.inputs.name }}" >> "$GITHUB_OUTPUT"
+            echo "id=manual-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          else
+            f=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} -- 'jobs/*.json' | tail -1)
+            [ -z "$f" ] && f=$(ls -t jobs/*.json | head -1)
+            echo "job file: $f"
+            echo "url=$(jq -r .url "$f")" >> "$GITHUB_OUTPUT"
+            echo "name=$(jq -r '.name // empty' "$f")" >> "$GITHUB_OUTPUT"
+            echo "id=$(basename "$f" .json)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install yt-dlp + ffmpeg
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
+          python3 -m pip install -q -U yt-dlp requests
+          yt-dlp --version
+
+      - name: Download
+        id: dl
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p out
+          NAME="${{ steps.job.outputs.name }}"
+          TEMPLATE='out/%(title).120B [%(id)s].%(ext)s'
+          [ -n "$NAME" ] && TEMPLATE="out/${NAME}.%(ext)s"
+          yt-dlp --no-playlist --newline --restrict-filenames \
+            -f 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*+ba/b' \
+            --merge-output-format mp4 \
+            -o "$TEMPLATE" \
+            "${{ steps.job.outputs.url }}" 2>&1 | tee yt-dlp.log
+          ls -la out
+
+      - name: Upload to HyperDrop
+        id: up
+        if: steps.dl.outcome == 'success'
+        run: |
+          set -e
+          curl -sO "$HD_URL/hd_upload.py"
+          f=$(ls -S out/* | head -1)
+          python3 hd_upload.py "$f" | tee result.json
+
+      - name: Record result
+        if: always()
+        run: |
+          set -e
+          mkdir -p results
+          id="${{ steps.job.outputs.id }}"
+          if [ -f result.json ]; then
+            jq -n --arg id "$id" --arg url "${{ steps.job.outputs.url }}" --arg status ok --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              --slurpfile r result.json '{id:$id,url:$url,status:$status,run:$run,result:$r[0],finished:now|todate}' > "results/$id.json"
+          else
+            err=$(grep -iE "ERROR|error:" yt-dlp.log 2>/dev/null | tail -5 | tr '\n' ' ' | cut -c1-800)
+            jq -n --arg id "$id" --arg url "${{ steps.job.outputs.url }}" --arg status failed --arg err "$err" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '{id:$id,url:$url,status:$status,error:$err,run:$run,finished:now|todate}' > "results/$id.json"
+          fi
+          cat "results/$id.json"
+          echo "## HyperDrop fetch: $id" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"; cat "results/$id.json" >> "$GITHUB_STEP_SUMMARY"; echo '```' >> "$GITHUB_STEP_SUMMARY"
+          git config user.name "hyperdrop-bot"; git config user.email "bot@hyperdrop"
+          git add results/
+          git commit -m "result: $id [skip ci]" || true
+          git pull --rebase -q || true
+          git push -q
