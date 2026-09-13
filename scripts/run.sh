@@ -28,11 +28,15 @@ yt-dlp --version
 mkdir -p out
 TEMPLATE='out/%(title).120B [%(id)s].%(ext)s'; [ -n "$NAME" ] && TEMPLATE="out/${NAME}.%(ext)s"
 COOKIE_ARGS=()
-if [ -n "${YT_COOKIES_B64:-}" ]; then echo "$YT_COOKIES_B64" | base64 -d > cookies.txt && COOKIE_ARGS=(--cookies cookies.txt); echo "using cookies"; fi
+RAW="${YT_COOKIES_B64:-}"
+if [ -n "$RAW" ]; then
+  if printf '%s' "$RAW" | grep -q "youtube.com"; then printf '%s\n' "$RAW" > cookies.txt; else printf '%s' "$RAW" | base64 -d > cookies.txt 2>/dev/null; fi
+  COOKIE_ARGS=(--cookies cookies.txt); echo "using cookies ($(wc -l < cookies.txt) lines)"
+fi
 STATUS=ok
 yt-dlp --no-playlist --newline --restrict-filenames "${COOKIE_ARGS[@]}" \
   -f 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*+ba/b' \
-  --merge-output-format mp4 -o "$TEMPLATE" "$URL" 2>&1 | tee yt-dlp.log || STATUS=failed
+  --extractor-args 'youtube:player_client=web,default' --merge-output-format mp4 -o "$TEMPLATE" "$URL" 2>&1 | tee yt-dlp.log || STATUS=failed
 ls -la out || true
 rm -f cookies.txt
 
