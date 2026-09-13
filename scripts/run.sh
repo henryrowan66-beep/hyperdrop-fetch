@@ -31,12 +31,21 @@ COOKIE_ARGS=()
 RAW="${YT_COOKIES_B64:-}"
 if [ -n "$RAW" ]; then
   if printf '%s' "$RAW" | grep -q "youtube.com"; then printf '%s\n' "$RAW" > cookies.txt; else printf '%s' "$RAW" | base64 -d > cookies.txt 2>/dev/null; fi
-  COOKIE_ARGS=(--cookies cookies.txt); echo "using cookies ($(wc -l < cookies.txt) lines)"
+  COOKIE_ARGS=(--cookies cookies.txt); COOKIE_LINES=$(grep -c "youtube.com" cookies.txt || true); echo "using cookies ($COOKIE_LINES youtube lines)"
 fi
-STATUS=ok
-yt-dlp --no-playlist --newline --restrict-filenames "${COOKIE_ARGS[@]}" \
-  -f 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*+ba/b' \
-  --extractor-args 'youtube:player_client=web,default' --merge-output-format mp4 -o "$TEMPLATE" "$URL" 2>&1 | tee yt-dlp.log || STATUS=failed
+COOKIE_LINES="${COOKIE_LINES:-0}"
+
+STATUS=failed
+FMT='bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*+ba/b'
+: > yt-dlp.log
+for CLIENT in default tv mweb; do
+  echo "=== attempt with player_client=$CLIENT ===" | tee -a yt-dlp.log
+  if yt-dlp --no-playlist --newline --restrict-filenames "${COOKIE_ARGS[@]}" -f "$FMT" \
+       --extractor-args "youtube:player_client=$CLIENT" --merge-output-format mp4 -o "$TEMPLATE" "$URL" 2>&1 | tee -a yt-dlp.log; then
+    STATUS=ok; ATTEMPT_CLIENT=$CLIENT; break
+  fi
+  case "$URL" in *youtube.com*|*youtu.be*) ;; *) break;; esac   # only retry clients for YouTube
+done
 ls -la out || true
 rm -f cookies.txt
 
@@ -53,11 +62,11 @@ fi
 mkdir -p results
 if [ "$STATUS" = ok ] && [ -s result.json ]; then
   jq -n --arg id "$ID" --arg url "$URL" --arg run "$RUN_URL" --slurpfile r result.json \
-    '{id:$id,url:$url,status:"ok",run:$run,result:$r[0],finished:(now|todate)}' > "results/$ID.json"
+    --arg cl "$COOKIE_LINES" --arg client "${ATTEMPT_CLIENT:-}" '{id:$id,url:$url,status:"ok",run:$run,cookieLines:($cl|tonumber),client:$client,result:$r[0],finished:(now|todate)}' > "results/$ID.json"
 else
-  err=$(grep -iE "ERROR" yt-dlp.log 2>/dev/null | tail -3 | tr '\n' ' ' | cut -c1-600)
+  err=$(grep -iE "ERROR|=== attempt|WARNING.*(cookie|sign in)" yt-dlp.log 2>/dev/null | tail -8 | tr '\n' ' ' | cut -c1-1200)
   jq -n --arg id "$ID" --arg url "$URL" --arg run "$RUN_URL" --arg err "${err:-unknown error}" \
-    '{id:$id,url:$url,status:"failed",error:$err,run:$run,finished:(now|todate)}' > "results/$ID.json"
+    --arg cl "$COOKIE_LINES" '{id:$id,url:$url,status:"failed",error:$err,cookieLines:($cl|tonumber),run:$run,finished:(now|todate)}' > "results/$ID.json"
 fi
 cat "results/$ID.json"
 { echo "## HyperDrop fetch: $ID"; echo '```json'; cat "results/$ID.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
